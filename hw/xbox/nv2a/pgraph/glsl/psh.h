@@ -52,6 +52,7 @@ typedef struct PshState {
     int colorkey_mode[4];
     enum ConvolutionFilter conv_tex[4];
     bool tex_x8y24[4];
+    bool bumpenv_rt_workaround[4];
     int dim_tex[4];
     bool tex_cubemap[4];
 

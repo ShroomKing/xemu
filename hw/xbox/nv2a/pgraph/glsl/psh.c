@@ -103,6 +103,7 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
             pgraph_reg_r(pg, NV_PGRAPH_COMBINEALPHAO0 + i * 4);
     }
 
+    bool unsigned_sz_x8r8g8b8[4] = { false };
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j++) {
             state->compare_mode[i][j] =
@@ -209,6 +210,35 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
         }
 
         state->conv_tex[i] = kernel;
+
+        unsigned_sz_x8r8g8b8[i] =
+            color_format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X8R8G8B8 &&
+            !(filter &
+              (NV_PGRAPH_TEXFILTER0_ASIGNED | NV_PGRAPH_TEXFILTER0_RSIGNED |
+               NV_PGRAPH_TEXFILTER0_GSIGNED | NV_PGRAPH_TEXFILTER0_BSIGNED));
+    }
+
+    /*
+     * Game-specific workaround, not hardware behaviour: Jet Set Radio Future's
+     * boost effect distorts a 128x128 render target with a swizzled X8R8G8B8
+     * bump map stored unsigned around 0x80 (no signed channel flags). Read as
+     * two's complement, neighbouring texels flip the offset between +1 and -1;
+     * with surface scaling the render target is sharp enough to show those
+     * jumps as hard edges. For a BUMPENVMAP stage that samples a linear 2D
+     * texture with such a bump map, the shader checks at runtime whether the
+     * texture is an upscaled render target (texScale > 1). If so, it reads
+     * du/dv from .r/.g with 0x80 as zero and samples the texture through a
+     * tent filter two native texels wide. At 1x nothing changes.
+     */
+    for (int i = 1; i < 4; i++) {
+        int mode = (state->shader_stage_program >> (i * 5)) & 0x1F;
+        /* Input stage as in pgraph_glsl_gen_psh() */
+        int input =
+            i == 1 ? 0 : (state->other_stage_input >> (8 + i * 4)) & 0xF;
+        state->bumpenv_rt_workaround[i] =
+            mode == PS_TEXTUREMODES_BUMPENVMAP && input < i &&
+            unsigned_sz_x8r8g8b8[input] && state->rect_tex[i] &&
+            state->dim_tex[i] == 2 && !state->tex_cubemap[i];
     }
 
     state->surface_zeta_format = pg->surface_shape.zeta_format;
@@ -1180,6 +1210,28 @@ static MString* psh_convert(struct PixelShader *ps)
         case PS_TEXTUREMODES_BUMPENVMAP:
             assert(i >= 1);
 
+            if (ps->state->bumpenv_rt_workaround[i]) {
+                /* See pgraph_glsl_set_psh_state(). The else branch is what the
+                 * code below generates for this stage. */
+                int bump_map = ps->input_tex[i];
+                mstring_append_fmt(
+                    vars,
+                    "vec2 dsdt%d;\n"
+                    "vec4 t%d;\n"
+                    "if (texScale[%d] > 1.0) {\n"
+                    "  dsdt%d = bumpMat[%d] * "
+                    "vec2(sign1(t%d.r), sign1(t%d.g));\n"
+                    "  t%d = bumpenvTent%d(pT%d.xy + dsdt%d);\n"
+                    "} else {\n"
+                    "  dsdt%d = bumpMat[%d] * "
+                    "vec2(sign3(t%d.b), sign3(t%d.g));\n"
+                    "  t%d = texture(texSamp%d, %s(pT%d.xy + dsdt%d));\n"
+                    "}\n",
+                    i, i, i, i, i, bump_map, bump_map, i, i, i, i, i, i,
+                    bump_map, bump_map, i, i, tex_remap, i, i);
+                break;
+            }
+
             if (ps->state->snorm_tex[ps->input_tex[i]]) {
                 /* Input color channels already signed (FIXME: May not always want signed textures in this case) */
                 mstring_append_fmt(vars, "vec2 dsdt%d = t%d.bg;\n",
@@ -1431,6 +1483,24 @@ static MString* psh_convert(struct PixelShader *ps)
                 "    return vec4(norm%d(coord.xy), 0, coord.w);\n"
                 "}\n",
                 i, i);
+            }
+
+            if (ps->state->bumpenv_rt_workaround[i]) {
+                /* Tent filter two native texels wide; coord is in texels */
+                mstring_append_fmt(preflight,
+                "vec4 bumpenvTent%d(vec2 coord) {\n"
+                "    const float o[4] = float[4](-0.75, -0.25, 0.25, 0.75);\n"
+                "    const float w[4] = float[4](0.125, 0.375, 0.375, 0.125);\n"
+                "    vec4 sum = vec4(0.0);\n"
+                "    for (int y = 0; y < 4; y++) {\n"
+                "        for (int x = 0; x < 4; x++) {\n"
+                "            sum += w[x] * w[y] * texture(texSamp%d,\n"
+                "                       norm%d(coord + vec2(o[x], o[y])));\n"
+                "        }\n"
+                "    }\n"
+                "    return sum;\n"
+                "}\n",
+                i, i, i);
             }
         }
     }
